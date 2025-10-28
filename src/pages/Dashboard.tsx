@@ -1,31 +1,30 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, setAuth } from "../api";
-
 import {
-  AppBar,
-  Toolbar,
-  Typography,
-  Box,
-  Button,
-  TextField,
-  Paper,
-  Chip,
-  Checkbox,
-  IconButton,
-} from '@mui/material';
-import DeleteIcon from '@mui/icons-material/Delete';
-import EditIcon from '@mui/icons-material/Edit';
+  cacheTasks,
+  getAllTasksLocal,
+  putTaskLocal,
+  removeTaskLocal,
+  queue,
+  type OutboxOp,
+} from "../offline/db.ts";
+import { syncNow, setupOnlineSync } from "../offline/sync.ts";
 
-// === Modelo alineado a tu backend ===
+type Status = "Pendiente" | "En Progreso" | "Completada";
+
 type Task = {
-  _id: string;
+  _id: string;                 // serverId o clienteId (offline)
   title: string;
   description?: string;
-  status: "Pendiente" | "En Progreso" | "Completada";
+  status: Status;
   clienteId?: string;
   createdAt?: string;
   deleted?: boolean;
+  pending?: boolean;           // <- muestra “Falta sincronizar”
 };
+
+// id local (no 24 hex de Mongo)
+const isLocalId = (id: string) => !/^[a-f0-9]{24}$/i.test(id);
 
 // Normaliza lo que venga del backend
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -43,6 +42,7 @@ function normalizeTask(x: any): Task {
     clienteId: x?.clienteId,
     createdAt: x?.createdAt,
     deleted: !!x?.deleted,
+    pending: !!x?.pending,
   };
 }
 
@@ -50,24 +50,61 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [title, setTitle] = useState("");
-  const [description, setDescription] = useState("");          // ⬅️ Nuevo
+  const [description, setDescription] = useState("");
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<"all" | "active" | "completed">("all");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
-  const [editingDescription, setEditingDescription] = useState(""); // ⬅️ Nuevo
+  const [editingDescription, setEditingDescription] = useState("");
+  const [online, setOnline] = useState<boolean>(navigator.onLine);
 
   useEffect(() => {
     setAuth(localStorage.getItem("token"));
-    loadTasks();
+
+    // Suscripción que dispara sync al volver online (definida en offline/sync)
+    const unsubscribe = setupOnlineSync();
+
+    // Handlers de estado (sin recargar)
+    const on = async () => {
+      setOnline(true);
+      await syncNow();
+      await loadFromServer();
+    };
+    const off = () => setOnline(false);
+    window.addEventListener("online", on);
+    window.addEventListener("offline", off);
+
+    (async () => {
+      // 1) Mostrar cache local primero
+      const local = await getAllTasksLocal();
+      if (local?.length) setTasks(local.map(normalizeTask));
+
+      // 2) Intentar traer del server
+      await loadFromServer();
+
+      // 3) Intentar sincronizar pendientes
+      await syncNow();
+
+      // 4) Re-cargar del server por si hubo mapeos nuevos
+      await loadFromServer();
+    })();
+
+    return () => {
+      unsubscribe?.();
+      window.removeEventListener("online", on);
+      window.removeEventListener("offline", off);
+    };
   }, []);
 
-  async function loadTasks() {
-    setLoading(true);
+  async function loadFromServer() {
     try {
       const { data } = await api.get("/tasks"); // { items: [...] }
-      const raw = Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : [];
-      setTasks(raw.map(normalizeTask));
+      const raw = Array.isArray(data?.items) ? data.items : [];
+      const list = raw.map(normalizeTask);
+      setTasks(list);
+      await cacheTasks(list);
+    } catch {
+      // si falla, nos quedamos con lo local
     } finally {
       setLoading(false);
     }
@@ -78,21 +115,50 @@ export default function Dashboard() {
     const t = title.trim();
     const d = description.trim();
     if (!t) return;
-    const { data } = await api.post("/tasks", { title: t, description: d }); // ⬅️ Envia descripción
-    const created = normalizeTask(data?.task ?? data);
-    setTasks((prev) => [created, ...prev]);
+
+    // Crear local inmediatamente
+    const clienteId = crypto.randomUUID();
+    const localTask = normalizeTask({
+      _id: clienteId,
+      title: t,
+      description: d,
+      status: "Pendiente" as Status,
+      pending: !navigator.onLine, // <- marca “Falta sincronizar” si no hay red
+    });
+
+    setTasks((prev) => [localTask, ...prev]);
+    await putTaskLocal(localTask);
     setTitle("");
     setDescription("");
-  }
 
-  async function toggleTask(task: Task) {
-    const newStatus = task.status === "Completada" ? "Pendiente" : "Completada";
-    const updated = { ...task, status: newStatus };
-    setTasks((prev) => prev.map((x) => (x._id === task._id ? updated : x)));
+    if (!navigator.onLine) {
+      const op: OutboxOp = {
+        id: "op-" + clienteId,
+        op: "create",
+        clienteId,
+        data: localTask,
+        ts: Date.now(),
+      };
+      await queue(op);
+      return;
+    }
+
+    // Online directo
     try {
-      await api.put(`/tasks/${task._id}`, { status: newStatus });
+      const { data } = await api.post("/tasks", { title: t, description: d });
+      const created = normalizeTask(data?.task ?? data);
+      setTasks((prev) => prev.map((x) => (x._id === clienteId ? created : x)));
+      await putTaskLocal(created);
     } catch {
-      setTasks((prev) => prev.map((x) => (x._id === task._id ? task : x)));
+      // si falla, encola
+      const op: OutboxOp = {
+        id: "op-" + clienteId,
+        op: "create",
+        clienteId,
+        data: localTask,
+        ts: Date.now(),
+      };
+      await queue(op);
     }
   }
 
@@ -104,28 +170,88 @@ export default function Dashboard() {
 
   async function saveEdit(taskId: string) {
     const newTitle = editingTitle.trim();
-    const newDesc = editingDescription.trim();
+    const newDesc  = editingDescription.trim();
     if (!newTitle) return;
 
     const before = tasks.find((t) => t._id === taskId);
-    setTasks((prev) =>
-      prev.map((t) => (t._id === taskId ? { ...t, title: newTitle, description: newDesc } : t))
-    );
+    const patched = { ...before, title: newTitle, description: newDesc } as Task;
+
+    setTasks((prev) => prev.map((t) => (t._id === taskId ? patched : t)));
+    await putTaskLocal(patched);
     setEditingId(null);
+
+    if (!navigator.onLine) {
+      await queue({
+        id: "upd-" + taskId,
+        op: "update",
+        clienteId: isLocalId(taskId) ? taskId : undefined,
+        serverId: isLocalId(taskId) ? undefined : taskId,
+        data: { title: newTitle, description: newDesc },
+        ts: Date.now(),
+      } as OutboxOp);
+      return;
+    }
+
     try {
-      await api.put(`/tasks/${taskId}`, { title: newTitle, description: newDesc }); // ⬅️ Envía descripción
+      await api.put(`/tasks/${taskId}`, { title: newTitle, description: newDesc });
     } catch {
-      if (before) setTasks((prev) => prev.map((t) => (t._id === taskId ? before : t)));
+      await queue({
+        id: "upd-" + taskId,
+        op: "update",
+        serverId: taskId,
+        data: { title: newTitle, description: newDesc },
+        ts: Date.now(),
+      } as OutboxOp);
+    }
+  }
+
+  async function handleStatusChange(task: Task, newStatus: Status) {
+    const updated = { ...task, status: newStatus };
+    setTasks((prev) => prev.map((x) => (x._id === task._id ? updated : x)));
+    await putTaskLocal(updated);
+
+    if (!navigator.onLine) {
+      await queue({
+        id: "upd-" + task._id,
+        op: "update",
+        serverId: isLocalId(task._id) ? undefined : task._id,
+        clienteId: isLocalId(task._id) ? task._id : undefined,
+        data: { status: newStatus },
+        ts: Date.now(),
+      });
+      return;
+    }
+
+    try {
+      await api.put(`/tasks/${task._id}`, { status: newStatus });
+    } catch {
+      await queue({
+        id: "upd-" + task._id,
+        op: "update",
+        serverId: task._id,
+        data: { status: newStatus },
+        ts: Date.now(),
+      });
     }
   }
 
   async function removeTask(taskId: string) {
     const backup = tasks;
     setTasks((prev) => prev.filter((t) => t._id !== taskId));
+    await removeTaskLocal(taskId);
+
+    if (!navigator.onLine) {
+      await queue({ id: "del-" + taskId, op: "delete", serverId: isLocalId(taskId) ? undefined : taskId, clienteId: isLocalId(taskId) ? taskId : undefined, ts: Date.now() });
+      return;
+    }
+
     try {
       await api.delete(`/tasks/${taskId}`);
     } catch {
+      // rollback + encola
       setTasks(backup);
+      for (const t of backup) await putTaskLocal(t);
+      await queue({ id: "del-" + taskId, op: "delete", serverId: taskId, clienteId: isLocalId(taskId) ? taskId : undefined, ts: Date.now() });
     }
   }
 
@@ -142,7 +268,7 @@ export default function Dashboard() {
       list = list.filter(
         (t) =>
           (t.title || "").toLowerCase().includes(s) ||
-          (t.description || "").toLowerCase().includes(s) // ⬅️ Busca también por descripción
+          (t.description || "").toLowerCase().includes(s)
       );
     }
     if (filter === "active") list = list.filter((t) => t.status !== "Completada");
@@ -157,150 +283,144 @@ export default function Dashboard() {
   }, [tasks]);
 
   return (
-    <Box className="wrap">
-  {/* ===== Topbar ===== */}
-  <AppBar position="static" color="primary">
-    <Toolbar>
-      <Typography variant="h6" sx={{ flexGrow: 1 }}>To-Do PWA</Typography>
-      <Box sx={{ display: 'flex', gap: 2 }}>
-        <Typography>Total: {stats.total}</Typography>
-        <Typography>Hechas: {stats.done}</Typography>
-        <Typography>Pendientes: {stats.pending}</Typography>
-      </Box>
-      <Button color="error" variant="contained" onClick={logout}>Salir</Button>
-    </Toolbar>
-  </AppBar>
+    <div className="wrap">
+      <header className="topbar">
+        <h1>To-Do PWA</h1>
+        <div className="spacer" />
+        <div className="stats">
+          <span>Total: {stats.total}</span>
+          <span>Hechas: {stats.done}</span>
+          <span>Pendientes: {stats.pending}</span>
+          <span className="badge" style={{ marginLeft: 8, background: online ? "#1f6feb" : "#b45309" }}>
+            {online ? "Online" : "Offline"}
+          </span>
+        </div>
+        <button className="btn danger" onClick={logout}>Salir</button>
+      </header>
 
-  <Box component="main" sx={{ p: 3 }}>
-    {/* ===== Crear ===== */}
-    <Paper elevation={2} sx={{ p: 2, mb: 3 }}>
-      <Typography variant="h6" gutterBottom>Agregar tarea</Typography>
-      <Box component="form" onSubmit={addTask} sx={{ display: 'grid', gap: 2 }}>
-        <TextField
-          fullWidth
-          label="Título de la tarea…"
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-        />
-        <TextField
-          fullWidth
-          label="Descripción (opcional)…"
-          multiline
-          rows={2}
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-        />
-        <Button variant="contained" type="submit">Agregar</Button>
-      </Box>
-    </Paper>
+      <main>
+        {/* ===== Crear ===== */}
+        <form className="add add-grid" onSubmit={addTask}>
+          <input
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            placeholder="Título de la tarea…"
+          />
+          <textarea
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="Descripción (opcional)…"
+            rows={2}
+          />
+          <button className="btn">Agregar</button>
+        </form>
 
-    {/* ===== Toolbar ===== */}
-    <Box className="toolbar" sx={{ mb: 3 }}>
-      <TextField
-        fullWidth
-        label="Buscar por título o descripción…"
-        value={search}
-        onChange={(e) => setSearch(e.target.value)}
-        sx={{ mb: 2 }}
-      />
-      <Box sx={{ display: 'flex', gap: 1 }}>
-        <Chip
-          label="Todas"
-          color={filter === "all" ? "primary" : "default"}
-          onClick={() => setFilter("all")}
-        />
-        <Chip
-          label="Activas"
-          color={filter === "active" ? "primary" : "default"}
-          onClick={() => setFilter("active")}
-        />
-        <Chip
-          label="Hechas"
-          color={filter === "completed" ? "primary" : "default"}
-          onClick={() => setFilter("completed")}
-        />
-      </Box>
-    </Box>
+        {/* ===== Toolbar ===== */}
+        <div className="toolbar">
+          <input
+            className="search"
+            placeholder="Buscar por título o descripción…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          <div className="filters">
+            <button
+              className={filter === "all" ? "chip active" : "chip"}
+              onClick={() => setFilter("all")}
+              type="button"
+            >
+              Todas
+            </button>
+            <button
+              className={filter === "active" ? "chip active" : "chip"}
+              onClick={() => setFilter("active")}
+              type="button"
+            >
+              Activas
+            </button>
+            <button
+              className={filter === "completed" ? "chip active" : "chip"}
+              onClick={() => setFilter("completed")}
+              type="button"
+            >
+              Hechas
+            </button>
+          </div>
+        </div>
 
-    {/* ===== Lista ===== */}
-    {loading ? (
-      <Typography>Cargando…</Typography>
-    ) : filtered.length === 0 ? (
-      <Typography color="text.secondary">Sin tareas</Typography>
-    ) : (
-      <Box component="ul" sx={{ listStyle: 'none', p: 0 }}>
-        {filtered.map((t) => (
-          <Paper
-            key={t._id}
-            sx={{
-              mb: 2,
-              p: 2,
-              display: 'flex',
-              alignItems: 'flex-start',
-              gap: 2,
-              backgroundColor: t.status === "Completada" ? '#e0f7fa' : 'inherit',
-            }}
-          >
-            <Checkbox
-              checked={t.status === "Completada"}
-              onChange={() => toggleTask(t)}
-            />
+        {/* ===== Lista ===== */}
+        {loading ? (
+          <p>Cargando…</p>
+        ) : filtered.length === 0 ? (
+          <p className="empty">Sin tareas</p>
+        ) : (
+          <ul className="list">
+            {filtered.map((t) => (
+              <li key={t._id} className={t.status === "Completada" ? "item done" : "item"}>
+                {/* Select de estado */}
+                <select
+                  value={t.status}
+                  onChange={(e) => handleStatusChange(t, e.target.value as Status)}
+                  className="status-select"
+                  title="Estado"
+                >
+                  <option value="Pendiente">Pendiente</option>
+                  <option value="En Progreso">En Progreso</option>
+                  <option value="Completada">Completada</option>
+                </select>
 
-            <Box sx={{ flexGrow: 1 }}>
-              {editingId === t._id ? (
-                <>
-                  <TextField
-                    fullWidth
-                    value={editingTitle}
-                    onChange={(e) => setEditingTitle(e.target.value)}
-                    placeholder="Título"
-                    autoFocus
-                    sx={{ mb: 1 }}
-                  />
-                  <TextField
-                    fullWidth
-                    multiline
-                    rows={2}
-                    value={editingDescription}
-                    onChange={(e) => setEditingDescription(e.target.value)}
-                    placeholder="Descripción"
-                  />
-                </>
-              ) : (
-                <>
-                  <Typography
-                    variant="subtitle1"
-                    sx={{ cursor: 'pointer' }}
-                    onDoubleClick={() => startEdit(t)}
-                  >
-                    {t.title}
-                  </Typography>
-                  {t.description && (
-                    <Typography variant="body2" color="text.secondary">
-                      {t.description}
-                    </Typography>
+                <div className="content">
+                  {editingId === t._id ? (
+                    <>
+                      <input
+                        className="edit"
+                        value={editingTitle}
+                        onChange={(e) => setEditingTitle(e.target.value)}
+                        placeholder="Título"
+                        autoFocus
+                      />
+                      <textarea
+                        className="edit"
+                        value={editingDescription}
+                        onChange={(e) => setEditingDescription(e.target.value)}
+                        placeholder="Descripción"
+                        rows={2}
+                      />
+                    </>
+                  ) : (
+                    <>
+                      <span className="title" onDoubleClick={() => startEdit(t)}>
+                        {t.title}
+                      </span>
+                      {t.description && <p className="desc">{t.description}</p>}
+                      {(t.pending || isLocalId(t._id)) && (
+                        <span
+                          className="badge"
+                          title="Aún no sincronizada"
+                          style={{ background: "#b45309", width: "fit-content" }}
+                        >
+                          Falta sincronizar
+                        </span>
+                      )}
+                    </>
                   )}
-                </>
-              )}
-            </Box>
+                </div>
 
-            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
-              {editingId === t._id ? (
-                <Button variant="outlined" onClick={() => saveEdit(t._id)}>Guardar</Button>
-              ) : (
-                <IconButton onClick={() => startEdit(t)} title="Editar">
-                  <EditIcon />
-                </IconButton>
-              )}
-              <IconButton color="error" onClick={() => removeTask(t._id)} title="Eliminar">
-                <DeleteIcon />
-              </IconButton>
-            </Box>
-          </Paper>
-        ))}
-      </Box>
-    )}
-  </Box>
-</Box>
+                <div className="actions">
+                  {editingId === t._id ? (
+                    <button className="btn" onClick={() => saveEdit(t._id)}>Guardar</button>
+                  ) : (
+                    <button className="icon" title="Editar" onClick={() => startEdit(t)}>✏️</button>
+                  )}
+                  <button className="icon danger" title="Eliminar" onClick={() => removeTask(t._id)}>
+                    🗑️
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </main>
+    </div>
   );
 }

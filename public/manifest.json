@@ -1,7 +1,7 @@
 {
         "name": "To-Do List",
         "short_name": "To-Do",
-        "description": "A simple tasks application",
+        "description": "A simple tasks application made by Enrique Rodriguez",
         "start_url": "./",
         "display": "standalone",
         "background_color": "#ffffff",

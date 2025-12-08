@@ -13,14 +13,14 @@ import { syncNow, setupOnlineSync } from "../offline/sync.ts";
 type Status = "Pendiente" | "En Progreso" | "Completada";
 
 type Task = {
-  _id: string;                 // serverId o clienteId (offline)
+  _id: string; // serverId o clienteId (offline)
   title: string;
   description?: string;
   status: Status;
   clienteId?: string;
   createdAt?: string;
   deleted?: boolean;
-  pending?: boolean;           // <- muestra “Falta sincronizar”
+  pending?: boolean; // <- muestra “Falta sincronizar”
 };
 
 // id local (no 24 hex de Mongo)
@@ -170,7 +170,7 @@ export default function Dashboard() {
 
   async function saveEdit(taskId: string) {
     const newTitle = editingTitle.trim();
-    const newDesc  = editingDescription.trim();
+    const newDesc = editingDescription.trim();
     if (!newTitle) return;
 
     const before = tasks.find((t) => t._id === taskId);
@@ -285,17 +285,23 @@ export default function Dashboard() {
   return (
     <div className="wrap">
       <header className="topbar">
+       
         <h1>To-Do PWA</h1>
         <div className="spacer" />
         <div className="stats">
           <span>Total: {stats.total}</span>
           <span>Hechas: {stats.done}</span>
           <span>Pendientes: {stats.pending}</span>
-          <span className="badge" style={{ marginLeft: 8, background: online ? "#1f6feb" : "#b45309" }}>
+          <span
+            className="badge"
+            style={{ marginLeft: 8, background: online ? "#22c55e" : "#ff8c00" }} // Verde para Online, Naranja para Offline
+          >
             {online ? "Online" : "Offline"}
           </span>
         </div>
-        <button className="btn danger" onClick={logout}>Salir</button>
+        <button className="btn danger" onClick={logout}>
+          Salir
+        </button>
       </header>
 
       <main>
@@ -312,7 +318,7 @@ export default function Dashboard() {
             placeholder="Descripción (opcional)…"
             rows={2}
           />
-          <button className="btn">Agregar</button>
+          <button className="btn primary">Agregar</button> {/* Clase 'primary' para el botón */}
         </form>
 
         {/* ===== Toolbar ===== */}
@@ -356,11 +362,16 @@ export default function Dashboard() {
         ) : (
           <ul className="list">
             {filtered.map((t) => (
-              <li key={t._id} className={t.status === "Completada" ? "item done" : "item"}>
+              <li
+                key={t._id}
+                className={t.status === "Completada" ? "item done" : "item"}
+              >
                 {/* Select de estado */}
                 <select
                   value={t.status}
-                  onChange={(e) => handleStatusChange(t, e.target.value as Status)}
+                  onChange={(e) =>
+                    handleStatusChange(t, e.target.value as Status)
+                  }
                   className="status-select"
                   title="Estado"
                 >
@@ -392,12 +403,18 @@ export default function Dashboard() {
                       <span className="title" onDoubleClick={() => startEdit(t)}>
                         {t.title}
                       </span>
-                      {t.description && <p className="desc">{t.description}</p>}
+                      {t.description && (
+                        <p className="desc">{t.description}</p>
+                      )}
                       {(t.pending || isLocalId(t._id)) && (
                         <span
                           className="badge"
                           title="Aún no sincronizada"
-                          style={{ background: "#b45309", width: "fit-content" }}
+                          style={{
+                            background: "#ff8c00",
+                            width: "fit-content",
+                            color: "#fff",
+                          }} // Naranja para Pendiente
                         >
                           Falta sincronizar
                         </span>
@@ -408,16 +425,33 @@ export default function Dashboard() {
 
                 <div className="actions">
                   {editingId === t._id ? (
-                    <button className="btn" onClick={() => saveEdit(t._id)}>Guardar</button>
+                    <button className="btn primary" onClick={() => saveEdit(t._id)}>
+                      Guardar
+                    </button>
                   ) : (
-                    <button className="icon" title="Editar" onClick={() => startEdit(t)}>✏️</button>
+                    <button
+                      className="icon primary"
+                      title="Editar"
+                      onClick={() => startEdit(t)}
+                    >
+                      ✏️
+                    </button>
                   )}
-                  <button className="icon danger" title="Eliminar" onClick={() => removeTask(t._id)}>
+                  <button
+                    className="icon danger"
+                    title="Eliminar"
+                    onClick={() => removeTask(t._id)}
+                  >
                     🗑️
                   </button>
                 </div>
               </li>
             ))}
+           <div style={{ width: '100%', textAlign: 'center' }}>
+    <img src="/icons/icon-512x512.png" alt="Logo de la app" style={{ maxWidth: 100 }}/>
+    <p>Made by Enrique Rodriguez</p>
+</div>
+              
           </ul>
         )}
       </main>

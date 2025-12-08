@@ -27,9 +27,11 @@ export default function Login()
           <Box sx={{mt:8, textAlign:"center"}}>
         <form onSubmit={onSubmit}>
             <link rel="icon" type="image/png" href="/icons/icon-512x512.png" />
+            
             <Paper elevation={3} sx={{ p: 4, maxWidth: 400, mx: 'auto', mt: 8 }}>
+                <img src="/icons/icon-512x512.png" alt="Logo de la app" style={{maxWidth: 100}}/>
                 <Typography variant="h5" gutterBottom>Login</Typography>
-
+                
                 <TextField
                     fullWidth
                     label="Email"
@@ -56,7 +58,7 @@ export default function Login()
                     sx={{ mt: 3 }}
                     type="submit"
                 >
-                    Ingresar
+                    Login
                 </Button>
 
                 {error && (
@@ -71,8 +73,11 @@ export default function Login()
                         Register!
                     </Link>
                 </Typography>
+                <Typography sx={{ mt: 2 }}>
+                    Made by Enrique Rodriguez
+                </Typography>
             </Paper>
         </form>
     </Box>
     );
-}
+} 
